@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mycontroller-org/server/v2/pkg/types"
 	msgTY "github.com/mycontroller-org/server/v2/pkg/types/message"
 	nodeTY "github.com/mycontroller-org/server/v2/pkg/types/node"
+	rsTY "github.com/mycontroller-org/server/v2/pkg/types/resource_service"
 	"github.com/mycontroller-org/server/v2/pkg/utils"
+	busUtils "github.com/mycontroller-org/server/v2/pkg/utils/bus_utils"
 	"github.com/mycontroller-org/server/v2/pkg/utils/convertor"
 	metricTY "github.com/mycontroller-org/server/v2/plugin/database/metric/types"
 	gwPtl "github.com/mycontroller-org/server/v2/plugin/gateway/protocol"
@@ -395,6 +398,20 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 			return true, nil, nil
 		}
 
+		// OTA-COMPLETION: I_SKETCH_VERSION is the reliable success signal.
+		// The node reports its new firmware version via the presentation
+		// message. If it matches the target memorized at setup, mark the
+		// OTA as successful.
+		if typeName == "I_SKETCH_VERSION" {
+			if node, err := p.getNode(msg.GatewayID, msMsg.NodeID); err == nil {
+				if node.Others.GetBool(types.FieldOTARunning) {
+					if targetVersion := node.Others.GetString(FieldOTATargetVersion); targetVersion != "" && msMsg.Payload == targetVersion {
+						p.forceOtaCompletion(node, true, "I_SKETCH_VERSION matches target")
+					}
+				}
+			}
+		}
+
 		// verify it is valid field to update
 		if fieldName, ok := internalValidFields[typeName]; ok {
 			msgPL.Key = fieldName
@@ -426,6 +443,25 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 				case "I_PRE_SLEEP_NOTIFICATION", "I_HEARTBEAT_RESPONSE", "I_DISCOVER_RESPONSE":
 					if typeName == "I_PRE_SLEEP_NOTIFICATION" {
 						msgPL.Others.Set(FieldAwakeDuration, msMsg.Payload, nil)
+
+						// OTA-COMPLETION: a smart-sleep node going to sleep
+						// during an OTA means the transfer is paused (or
+						// failed). Freeze the running flag without forcing
+						// progress to 100; keep the current progress so it
+						// can resume on next wake.
+						if node, err := p.getNode(msg.GatewayID, msMsg.NodeID); err == nil {
+							if node.Others.GetBool(types.FieldOTARunning) {
+								state := map[string]interface{}{
+									types.FieldOTARunning:  false,
+									types.FieldOTAStatusOn: time.Now(),
+								}
+								busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
+								p.logger.Info("OTA frozen on sleep notification",
+									zap.String("nodeId", node.NodeID),
+									zap.String("gatewayId", node.GatewayID),
+								)
+							}
+						}
 					}
 					// post an action to sen the messages in the queue
 					awakeActionMsg := &msgTY.Message{

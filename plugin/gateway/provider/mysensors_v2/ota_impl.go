@@ -40,6 +40,19 @@ func (p *Provider) executeFirmwareConfigRequest(msg *msgTY.Message) (string, err
 		return "", err
 	}
 
+	// OTA-COMPLETION: a CONFIG_REQUEST after a reboot means the previous OTA
+	// is over. Close it before starting a new one. Success is decided by
+	// comparing the current node version with the target memorized at setup.
+	if node.Others.GetBool(types.FieldOTARunning) {
+		success := false
+		if targetVersion := node.Others.GetString(FieldOTATargetVersion); targetVersion != "" {
+			if node.Labels.Get("version") == targetVersion {
+				success = true
+			}
+		}
+		p.forceOtaCompletion(node, success, "ST_FIRMWARE_CONFIG_REQUEST after reboot")
+	}
+
 	// Detect and persist bootloader kind
 	if rxPL != "" {
 		p.rememberBootloaderKind(node, rxPL)
@@ -227,6 +240,20 @@ func (p *Provider) buildFirmwareConfigResponse(node *nodeTY.Node, fwRaw *firmwar
 		fwCfgRes.Version = fwRaw.Version
 		fwCfgRes.Blocks = fwRaw.Blocks
 		fwCfgRes.CRC = fwRaw.CRC
+
+		// OTA-COMPLETION: memorize the target version/CRC/type so that a
+		// later reboot or version signal can decide whether the OTA
+		// actually succeeded, even if the final block status is lost.
+		state := map[string]interface{}{
+			types.FieldOTARunning:    true,
+			types.FieldOTAProgress:   0,
+			types.FieldOTAStatusOn:   time.Now(),
+			types.FieldOTABlockTotal: fwRaw.Blocks,
+			FieldOTATargetVersion:    fmt.Sprintf("%d", fwRaw.Version),
+			FieldOTATargetCRC:        fmt.Sprintf("%04X", fwRaw.CRC),
+			FieldOTATargetType:       fmt.Sprintf("%d", fwRaw.Type),
+		}
+		busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
 	}
 	p.logger.Debug("sending a firmware config response",
 		zap.Any("response", fwCfgRes),
@@ -237,6 +264,48 @@ func (p *Provider) buildFirmwareConfigResponse(node *nodeTY.Node, fwRaw *firmwar
 	)
 
 	return p.toHex(fwCfgRes)
+}
+
+// OTA-COMPLETION: forceOtaCompletion publishes a final OTA state.
+// Called when a reboot signal, version change, sleep notification or timeout
+// indicates that the OTA is over. Success is decided by comparing the
+// current node version with the target memorized at setup, unless the caller
+// already knows the outcome.
+func (p *Provider) forceOtaCompletion(node *nodeTY.Node, success bool, reason string) {
+	if node == nil || node.Others == nil {
+		return
+	}
+	if !node.Others.GetBool(types.FieldOTARunning) {
+		return
+	}
+
+	// Cross-check: if the node already reports the target version, it's a success.
+	if targetVersion := node.Others.GetString(FieldOTATargetVersion); targetVersion != "" {
+		if node.Labels.Get("version") == targetVersion {
+			success = true
+		}
+	}
+
+	progress := 0
+	if success {
+		progress = 100
+	}
+
+	state := map[string]interface{}{
+		types.FieldOTARunning:  false,
+		types.FieldOTAProgress: progress,
+		types.FieldOTAEndTime:  time.Now(),
+	}
+	busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
+
+	p.logger.Info("OTA completion forced",
+		zap.String("nodeId", node.NodeID),
+		zap.String("gatewayId", node.GatewayID),
+		zap.Bool("success", success),
+		zap.String("reason", reason),
+		zap.String("targetVersion", node.Others.GetString(FieldOTATargetVersion)),
+		zap.String("currentVersion", node.Labels.Get("version")),
+	)
 }
 
 // executeFirmwareRequest executes firmware request and response with hex payload
