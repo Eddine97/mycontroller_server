@@ -21,6 +21,12 @@ const LabelOtaBlockSize = "ms_ota_block_size"
 // to FOTA scripts as `head` (hex). Scripts interpret the contents.
 const fotaFirmwareHeadBytes = 16
 
+const (
+	FieldOTATargetVersion = "ota_target_version"
+	FieldOTATargetCRC     = "ota_target_crc"
+	FieldOTATargetType    = "ota_target_type"
+)
+
 // firmwareConfigRequest data (stock 10-byte layout; longer payloads still decode first 10)
 type firmwareConfigRequest struct {
 	Type              uint16

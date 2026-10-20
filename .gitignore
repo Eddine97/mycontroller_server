@@ -17,3 +17,5 @@ builds/*
 /web-console/.env
 /web-console/tx
 /pkg/http_router/web-console/assets/web_console.zip
+myc
+mycontroller-server

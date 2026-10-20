@@ -6,6 +6,7 @@ import (
 
 	msgTY "github.com/mycontroller-org/server/v2/pkg/types/message"
 	nodeTY "github.com/mycontroller-org/server/v2/pkg/types/node"
+	gwPtl "github.com/mycontroller-org/server/v2/plugin/gateway/protocol"
 	"go.uber.org/zap"
 )
 
@@ -13,8 +14,12 @@ import (
 // considered "awake". Below this threshold, we assume it can receive messages.
 const smartSleepRecentlySeen = 30 * time.Second
 
+// otaRebootDeliveryDelayDefault is the delay between a wake signal and the
+// I_REBOOT. Must stay strictly below the node's awake_duration.
+// Default: 200 ms. Overridable per node with bootloader_ota_reboot_delay.
+const otaRebootDeliveryDelayDefault = 200 * time.Millisecond
+
 // shouldRebootForOta reports whether the node opts into automatic reboot for OTA.
-// The label must be "true" (case-insensitive). Missing or "false" means no.
 func shouldRebootForOta(node *nodeTY.Node) bool {
 	if node == nil || node.Labels == nil {
 		return false
@@ -39,7 +44,6 @@ func isRecentlySeen(node *nodeTY.Node, threshold time.Duration) bool {
 }
 
 // maxSleepDuration returns an upper bound on the node's sleep cycle.
-// Falls back to 5 minutes when the label is missing.
 func maxSleepDuration(node *nodeTY.Node) time.Duration {
 	if node == nil || node.Labels == nil {
 		return 5 * time.Minute
@@ -58,15 +62,31 @@ func maxSleepDuration(node *nodeTY.Node) time.Duration {
 	return d
 }
 
+// otaRebootDeliveryDelay returns the delay for a given node.
+func otaRebootDeliveryDelay(node *nodeTY.Node) time.Duration {
+	if node == nil || node.Labels == nil {
+		return otaRebootDeliveryDelayDefault
+	}
+	v := node.Labels.GetInt(LabelBootloaderOtaRebootDelay)
+	if v < 0 {
+		return otaRebootDeliveryDelayDefault
+	}
+	if v == 0 {
+		// v == 0 explicitly means no delay
+		return 0
+	}
+	d := time.Duration(v) * time.Millisecond
+	if d < 50*time.Millisecond {
+		d = 50 * time.Millisecond
+	}
+	if d > 5*time.Second {
+		d = 5 * time.Second
+	}
+	return d
+}
+
 // maybeSendRebootForOta is called before serving a firmware-update action.
 // It sends I_REBOOT to awake nodes, or queues it for sleeping ones.
-//
-// A reboot is needed when either:
-//   - the user explicitly opted in with bootloader_ota_reboot=true, or
-//   - the detected bootloader is a MYSBootloader variant (any 1.x).
-//
-// Protocol 3.1 / DualOptiboot nodes do not need a reboot: they enter OTA on
-// their own when they receive the firmware config request.
 func (p *Provider) maybeSendRebootForOta(msg *msgTY.Message) error {
 	node, err := p.getNode(msg.GatewayID, msg.NodeID)
 	if err != nil {
@@ -86,15 +106,20 @@ func (p *Provider) maybeSendRebootForOta(msg *msgTY.Message) error {
 		return nil
 	}
 
-	// A reboot is needed. Queue it if the node is a smart-sleep node that is
-	// currently asleep; otherwise send it immediately.
-	if isSleepingNode(node) && !isRecentlySeen(node, smartSleepRecentlySeen) {
+	// [FIX n°2] For smart-sleep nodes, always queue the reboot, even if the
+	// node was seen recently. With awake_duration of only a few hundred ms,
+	// an immediate I_REBOOT almost always fails with "no acknowledgement
+	// received" because the node is already back asleep before the ACK
+	// round-trip completes.
+	if isSleepingNode(node) {
 		p.queueRebootForNode(node)
-		p.logger.Info("node is sleeping, I_REBOOT queued until next wake",
+		p.logger.Info("smart-sleep node, I_REBOOT queued until next wake",
 			zap.String("nodeId", node.NodeID),
 			zap.String("gatewayId", node.GatewayID),
 			zap.String("bootloaderKind", bootloaderKindForNode(node)),
 			zap.Bool("explicitOptIn", explicitOptIn),
+			zap.Bool("recentlySeen", isRecentlySeen(node, smartSleepRecentlySeen)),
+			zap.String("awakeDuration", node.Others.GetString(FieldAwakeDuration)),
 			zap.String("sleepDuration", node.Labels.Get(FieldSleepDuration)),
 			zap.Duration("maxWait", maxSleepDuration(node)),
 		)
@@ -105,18 +130,35 @@ func (p *Provider) maybeSendRebootForOta(msg *msgTY.Message) error {
 }
 
 // sendRebootNow sends an I_REBOOT to the node immediately.
+//
+// [FIX n°3] Build the raw MySensors message directly and call Protocol.Write,
+// bypassing p.Post() -> toRawMessage() -> handleActions() -> ActionReboot
+// -> queueRebootIfSleeping(). That path re-queues the reboot instead of
+// sending it, producing an infinite loop and "command type should not be
+// empty" error.
 func (p *Provider) sendRebootNow(node *nodeTY.Node) error {
-	rebootMsg := msgTY.NewMessage(false)
-	rebootMsg.GatewayID = node.GatewayID
-	rebootMsg.NodeID = node.NodeID
-	rebootMsg.Type = msgTY.TypeAction
+	// MySensors raw format: node-id;child-sensor-id;command;ack;type;payload
+	// I_REBOOT is: c=3 (C_INTERNAL), t=13 (I_REBOOT), no payload.
+	// Child-sensor-id 255 = broadcast at sensor level.
+	raw := fmt.Sprintf("%s;255;3;0;13;\n", node.NodeID)
 
-	pl := msgTY.NewPayload()
-	pl.Key = nodeTY.ActionReboot
-	rebootMsg.Payloads = []msgTY.Payload{pl}
+	rawMsg := &msgTY.RawMessage{
+		Timestamp: time.Now(),
+		Data:      []byte(raw),
+		ID:        fmt.Sprintf("%s-%s-reboot", node.GatewayID, node.NodeID),
+	}
+	rawMsg.Others = rawMsg.Others.Init()
 
-	if err := p.Post(&rebootMsg); err != nil {
-		return fmt.Errorf("post reboot for OTA: %w", err)
+	// MQTT protocol uses a topic instead of a raw payload.
+	if p.ProtocolType == gwPtl.TypeMQTT {
+		rawMsg.Data = []byte("255/3/0/13")
+		rawMsg.Others.Set(gwPtl.KeyMqttTopic, []string{
+			fmt.Sprintf("out_%s/%s/255/3/0/13", p.GatewayConfig.ID, node.NodeID),
+		}, nil)
+	}
+
+	if err := p.Protocol.Write(rawMsg); err != nil {
+		return fmt.Errorf("write reboot message: %w", err)
 	}
 
 	p.logger.Info("sent I_REBOOT before OTA",
@@ -135,10 +177,18 @@ func (p *Provider) queueRebootForNode(node *nodeTY.Node) {
 	}
 	key := p.getNodeStoreID(node.GatewayID, node.NodeID)
 	otaPendingRebootStore.Add(key, time.Now())
+	p.logger.Info("reboot queued",
+		zap.String("nodeId", node.NodeID),
+		zap.String("gatewayId", node.GatewayID),
+		zap.String("key", key),
+	)
 }
 
 // deliverQueuedRebootIfAny sends a pending I_REBOOT when the node is known to be awake.
 // Safe to call multiple times; the entry is removed on first successful delivery.
+//
+// [FIX n°4] Use p.GatewayConfig.ID consistently. Earlier versions used
+// msg.GatewayID which was often empty, producing mismatched store keys.
 func (p *Provider) deliverQueuedRebootIfAny(gatewayID, nodeID string) {
 	key := p.getNodeStoreID(gatewayID, nodeID)
 	v := otaPendingRebootStore.Get(key)
@@ -157,15 +207,17 @@ func (p *Provider) deliverQueuedRebootIfAny(gatewayID, nodeID string) {
 		return
 	}
 
+	delay := otaRebootDeliveryDelay(node)
+
 	p.logger.Info("delivering queued I_REBOOT to awake node",
 		zap.String("nodeId", node.NodeID),
 		zap.String("gatewayId", node.GatewayID),
+		zap.Duration("delay", delay),
+		zap.String("awakeDuration", node.Others.GetString(FieldAwakeDuration)),
 	)
 
-	// Allow a short delay so the node has completed its wake-up sequence
-	// (heartbeat, I_CONFIG, presentation, ...) before receiving I_REBOOT.
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(delay)
 		if err := p.sendRebootNow(node); err != nil {
 			p.logger.Error("failed to deliver queued reboot",
 				zap.String("nodeId", node.NodeID),

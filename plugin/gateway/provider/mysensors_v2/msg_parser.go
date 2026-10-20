@@ -33,7 +33,6 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 		Payload:  payload.Value.String(),
 	}
 
-	// update broadcast id
 	if msMsg.NodeID == "" {
 		msMsg.NodeID = idBroadcast
 	}
@@ -41,7 +40,6 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 		msMsg.SensorID = idBroadcast
 	}
 
-	// init labels and others
 	payload.Labels = payload.Labels.Init()
 	payload.Others = payload.Others.Init()
 
@@ -52,7 +50,6 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 	rawMsg := &msgTY.RawMessage{Timestamp: msg.Timestamp}
 	rawMsg.Others = rawMsg.Others.Init()
 
-	// get command
 	switch msg.Type {
 	case msgTY.TypeSet:
 		msMsg.Command = cmdSet
@@ -82,17 +79,13 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 
 	case msgTY.TypeAction:
 		msMsg.Command = cmdInternal
-		// call functions
 		err := p.handleActions(p.GatewayConfig, payload.Key, msg, &msMsg)
 		if err != nil {
 			return nil, err
 		}
 		if msMsg.Type == "" {
 			switch payload.Key {
-			case nodeTY.ActionFirmwareUpdate,
-				"ST_FIRMWARE_CONFIG_REQUEST",
-				"ST_FIRMWARE_REQUEST",
-				nodeTY.ActionSetSleepDuration:
+			case nodeTY.ActionFirmwareUpdate, "ST_FIRMWARE_CONFIG_REQUEST", "ST_FIRMWARE_REQUEST":
 				p.logger.Debug("firmware action produced no message", zap.String("action", payload.Key))
 				return nil, nil
 			}
@@ -106,10 +99,8 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 		return nil, errors.New("command type should not be empty")
 	}
 
-	// enable or disable acknowledgement
 	msMsg.Ack = p.getAcknowledgementStatus(&msMsg)
 
-	// create rawMessage
 	switch p.ProtocolType {
 	case gwPtl.TypeSerial, gwPtl.TypeEthernet:
 		rawMsg.Data = []byte(msMsg.toMySensorsRaw(false))
@@ -122,12 +113,10 @@ func (p *Provider) toRawMessage(msg *msgTY.Message) (*msgTY.RawMessage, error) {
 		return nil, fmt.Errorf("protocol type not implemented: %s", p.ProtocolType)
 	}
 
-	// set acknowledgement request status
 	if msMsg.Ack == "1" {
 		rawMsg.IsAckEnabled = true
 	}
 
-	// set id for raw message
 	rawMsg.ID = generateMessageID(&msMsg)
 
 	return rawMsg, nil
@@ -149,7 +138,23 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 		return nil, nil
 	}
 
-	// if it is a acknowledgement message send it to acknowledgement topic and proceed further
+	// [FIX n°5] Deliver any pending reboot or sleep command on any inbound
+	// message from the node. Smart-sleep nodes send t=33 at wake, then data,
+	// then t=32. Reacting only on t=32 leaves at most 2 s of window per 5 min
+	// cycle. Reacting on any message catches the node as soon as it starts
+	// talking.
+	if msMsg.NodeID != "" && msMsg.NodeID != idBroadcast {
+		key := p.getNodeStoreID(p.GatewayConfig.ID, msMsg.NodeID)
+		hasReboot := otaPendingRebootStore.Get(key) != nil
+		hasSleep := pendingSleepStore.Get(key) != nil
+		if hasReboot || hasSleep {
+			go func(gwID, nodeID string) {
+				p.deliverQueuedRebootIfAny(gwID, nodeID)
+				p.deliverQueuedSleepCommandIfAny(gwID, nodeID)
+			}(p.GatewayConfig.ID, msMsg.NodeID)
+		}
+	}
+
 	if msMsg.Ack == "1" && rawMsg.IsReceived {
 		msgID := generateMessageID(msMsg)
 		topicAck := fmt.Sprintf("%s.%s", p.GatewayConfig.ID, msgID)
@@ -159,8 +164,8 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 		}
 	}
 
-	// Message
 	msg := &msgTY.Message{
+		GatewayID:  p.GatewayConfig.ID, // [FIX] always set
 		NodeID:     msMsg.NodeID,
 		SourceID:   msMsg.SensorID,
 		IsAck:      msMsg.Ack == "1",
@@ -173,7 +178,6 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 
 	messages = append(messages, msg)
 
-	// update the payload details on return
 	includePayloads := func() { msg.Payloads = []msgTY.Payload{msgPL} }
 	defer includePayloads()
 
@@ -182,23 +186,19 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 		return nil, err
 	}
 
-	// set labels
 	msgPL.Labels.Set(LabelType, msMsg.Type)
-	if msg.NodeID != "" { // set node id if available
+	if msg.NodeID != "" {
 		msgPL.Labels.Set(LabelNodeID, msg.NodeID)
 	}
-	if msg.SourceID != "" { // set source id if available
+	if msg.SourceID != "" {
 		msgPL.Labels.Set(LabelSensorID, msg.SourceID)
 	}
 
-	// entering into normal message processing
 	switch {
-	case msMsg.NodeID == "" && msMsg.Command == cmdInternal: // broadcast messages
+	case msMsg.NodeID == "" && msMsg.Command == cmdInternal:
 		if typeName, ok := internalTypeMapForRx[msMsg.Type]; ok {
-			// update the requested action
 			_, isActionRequest := utils.FindItem(customValidActions, typeName)
 			if !isActionRequest {
-				// do not care about other types
 				return nil, nil
 			}
 			msg.Type = msgTY.TypeAction
@@ -207,58 +207,46 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 			return nil, fmt.Errorf("message internal(broadcast) type not found: %s", msMsg.Type)
 		}
 
-	case msMsg.SensorID != "": // perform sensor related stuff
+	case msMsg.SensorID != "":
 		switch msMsg.Command {
 		case cmdPresentation:
 			if _type, ok := presentationTypeMapForRx[msMsg.Type]; ok {
 				msgPL.Key = types.FieldName
 				msgPL.Labels.Set(LabelTypeString, _type)
 			}
-			// else: not supported? should I have to return from here?
-
 		case cmdSet, cmdRequest:
 			err := p.updateFieldAndUnit(msMsg, &msgPL)
 			if err != nil {
 				return nil, err
 			}
-
-		default:
-			// not supported? should I have to return from here?
 		}
 
-	case msMsg.NodeID != "": // perform node related stuff
+	case msMsg.NodeID != "":
 		switch msMsg.Command {
-
 		case cmdPresentation:
 			msgPL.Labels.Set(types.LabelNodeLibraryVersion, msMsg.Payload)
 			if _type, ok := presentationTypeMapForRx[msMsg.Type]; ok {
 				if _type == "S_ARDUINO_REPEATER_NODE" || _type == "S_ARDUINO_NODE" {
-					// this is a node lib version data
 					msgPL.Key = types.FieldNone
 					if _type == "S_ARDUINO_REPEATER_NODE" {
 						msgPL.Labels.Set(LabelNodeType, "repeater")
 					}
 				}
-				// else: return?
 			}
-			// else: return?
 
 		case cmdInternal:
-			proceedFurther, extraMessages, err := p.updateNodeInternalMessages(msg, &msgPL, msMsg)
+			proceedFurther, extraMessages, err := updateNodeInternalMessages(msg, &msgPL, msMsg)
 			if err != nil || !proceedFurther {
 				return nil, err
 			}
-
 			if len(extraMessages) > 0 {
 				messages = append(messages, extraMessages...)
 			}
 
 		case cmdStream:
 			if typeName, ok := streamTypeMapForRx[msMsg.Type]; ok {
-				// update the requested action
 				_, isActionRequest := utils.FindItem(customValidActions, typeName)
 				if !isActionRequest {
-					// do not care about other types
 					return nil, nil
 				}
 				msg.Type = msgTY.TypeAction
@@ -268,7 +256,7 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 			}
 		}
 
-	case msMsg.NodeID == "": // don't case about gateway broadcast message
+	case msMsg.NodeID == "":
 		return nil, nil
 
 	default:
@@ -279,18 +267,13 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 	return messages, nil
 }
 
-// helper functions
-
-// decodes raw message into message, which is local struct
+// decodeRawMessage decodes a raw message into the local struct.
 func (p *Provider) decodeRawMessage(rawMsg *msgTY.RawMessage) (*message, error) {
 	var d []string
 	payload := ""
 
-	// decode message from gateway
 	switch p.ProtocolType {
 	case gwPtl.TypeMQTT:
-		// topic/node-id/child-sensor-id/command/ack/type
-		// out_rfm69/11/1/1/0/0
 		rData := strings.Split(string(rawMsg.Others.Get(gwPtl.KeyMqttTopic).(string)), "/")
 		if len(rData) < 5 {
 			p.logger.Error("invalid message format", zap.Any("rawMessage", rawMsg))
@@ -299,7 +282,6 @@ func (p *Provider) decodeRawMessage(rawMsg *msgTY.RawMessage) (*message, error) 
 		d = rData[len(rData)-5:]
 		payload = convertor.ToString(rawMsg.Data)
 	case gwPtl.TypeSerial, gwPtl.TypeEthernet:
-		// node-id;child-sensor-id;command;ack;type;payload
 		_d := strings.Split(convertor.ToString(rawMsg.Data), ";")
 		if len(_d) < 6 {
 			p.logger.Error("invalid message format", zap.String("rawMessage", convertor.ToString(rawMsg.Data)))
@@ -307,12 +289,10 @@ func (p *Provider) decodeRawMessage(rawMsg *msgTY.RawMessage) (*message, error) 
 		}
 		payload = _d[5]
 		d = _d
-	// implement this one
 	default:
 		return nil, fmt.Errorf("this type not implements. protocol type: %s", p.ProtocolType)
 	}
 
-	// MySensors message
 	msMsg := &message{
 		NodeID:   d[0],
 		SensorID: d[1],
@@ -324,7 +304,6 @@ func (p *Provider) decodeRawMessage(rawMsg *msgTY.RawMessage) (*message, error) 
 	return msMsg, nil
 }
 
-// verify node and sensor ids
 func verifyAndUpdateNodeSensorIDs(msMsg *message, msg *msgTY.Message) error {
 	nID, err := strconv.ParseUint(msMsg.NodeID, 10, 64)
 	if err != nil {
@@ -341,24 +320,19 @@ func verifyAndUpdateNodeSensorIDs(msMsg *message, msg *msgTY.Message) error {
 		return fmt.Errorf("invalid sensor id: %s", msMsg.SensorID)
 	}
 
-	// Remove sensor id, if it is a internal message
 	if msMsg.SensorID == idBroadcast {
 		msMsg.SensorID = ""
 	}
-
-	// Remove node id, if it is a broadcast message
 	if msMsg.NodeID == idBroadcast {
 		msMsg.NodeID = ""
 	}
 
-	// update node id and sensor id
 	msg.SourceID = msMsg.SensorID
 	msg.NodeID = msMsg.NodeID
 
 	return nil
 }
 
-// update field name and unit
 func (p *Provider) updateFieldAndUnit(msMsg *message, msgPL *msgTY.Payload) error {
 	fieldName, ok := setReqFieldMapForRx[msMsg.Type]
 	if ok {
@@ -368,26 +342,22 @@ func (p *Provider) updateFieldAndUnit(msMsg *message, msgPL *msgTY.Payload) erro
 		p.logger.Warn("set or req not found. update this. Setting as V_CUSTOM", zap.Any("msMsg", msMsg))
 	}
 
-	// get type and unit
 	if typeUnit, ok := metricTypeAndUnit[fieldName]; ok {
 		msgPL.Key = fieldName
 		msgPL.MetricType = typeUnit.Type
 		msgPL.Unit = typeUnit.Unit
 	}
-	// else: not supported? should I have to return from here?
 
 	return nil
 }
 
-// updates node internal message data, return true, if further actions required
-// returns false, if the message can be dropped
-func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.Payload, msMsg *message) (bool, []*msgTY.Message, error) {
-	if msMsg.Ack == "1" { // do not care about internal ack messages
+// updateNodeInternalMessages updates node internal message data.
+func updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.Payload, msMsg *message) (bool, []*msgTY.Message, error) {
+	if msMsg.Ack == "1" {
 		return false, nil, nil
 	}
 	if typeName, ok := internalTypeMapForRx[msMsg.Type]; ok {
 		extraMessages := make([]*msgTY.Message, 0)
-		// update the requested access
 		_, isActionRequest := utils.FindItem(customValidActions, typeName)
 		if isActionRequest {
 			msg.Type = msgTY.TypeAction
@@ -395,7 +365,6 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 			return true, nil, nil
 		}
 
-		// verify it is valid field to update
 		if fieldName, ok := internalValidFields[typeName]; ok {
 			msgPL.Key = fieldName
 			msg.Type = msgTY.TypeSet
@@ -409,14 +378,11 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 				msgPL.Value = "true"
 
 			case LabelSmartSleepNode, types.FieldHeartbeat, types.FieldParentID:
-
-				// mark it as sleeping node
 				if fieldName == LabelSmartSleepNode {
 					msgPL.Labels.Set(types.LabelNodeSleepNode, "true")
 					msgPL.Labels.Set(LabelSmartSleepNode, "true")
 				}
 
-				// update for discover response
 				if fieldName == types.FieldParentID {
 					msgPL.Labels.Set(types.FieldParentID, msMsg.Payload)
 					msgPL.Others.Set(types.FieldParentID, msMsg.Payload, nil)
@@ -427,7 +393,6 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 					if typeName == "I_PRE_SLEEP_NOTIFICATION" {
 						msgPL.Others.Set(FieldAwakeDuration, msMsg.Payload, nil)
 					}
-					// post an action to sen the messages in the queue
 					awakeActionMsg := &msgTY.Message{
 						GatewayID:  msg.GatewayID,
 						NodeID:     msMsg.NodeID,
@@ -439,19 +404,10 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 					}
 					extraMessages = append(extraMessages, awakeActionMsg)
 
-					// Deliver any pending reboot, then any pending sleep command.
-					// Sequential to guarantee the reboot lands before the new
-					// sleep duration is pushed to the node.
-					go func(gwID, nodeID string) {
-						p.deliverQueuedRebootIfAny(gwID, nodeID)
-						p.deliverQueuedSleepCommandIfAny(gwID, nodeID)
-					}(msg.GatewayID, msMsg.NodeID)
-
 				case "I_POST_SLEEP_NOTIFICATION":
 					msgPL.Others.Set(FieldSleepDuration, msMsg.Payload, nil)
 
 				}
-
 			default:
 				// noop
 			}
@@ -459,16 +415,13 @@ func (p *Provider) updateNodeInternalMessages(msg *msgTY.Message, msgPL *msgTY.P
 			return true, extraMessages, nil
 		}
 
-		// if non hits just return from here
 		return false, nil, nil
 	}
 	return false, nil, fmt.Errorf("message internal type not found: %s", msMsg.Type)
 }
 
-// converts message to MySensors specific type
+// toMySensorsRaw converts a message to MySensors specific format.
 func (ms *message) toMySensorsRaw(isMQTT bool) string {
-	// raw message format
-	// node-id;child-sensor-id;command;ack;type;payload
 	if ms.NodeID == "" {
 		ms.NodeID = idBroadcast
 	}

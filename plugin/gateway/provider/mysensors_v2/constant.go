@@ -50,6 +50,14 @@ const (
 	// sent when the node next reports itself awake.
 	LabelBootloaderOtaReboot = "bootloader_ota_reboot"
 
+	// LabelBootloaderOtaRebootDelay overrides the delay (in milliseconds) between
+	// a wake signal (I_PRE_SLEEP_NOTIFICATION, I_HEARTBEAT_RESPONSE, ...) and the
+	// I_REBOOT sent for OTA. Default: 200 ms. Must stay below the node's
+	// awake_duration (typically the value reported in `awake_duration`).
+	//
+	// Values below 50 are clamped to 50, values above 5000 are clamped to 5000.
+	LabelBootloaderOtaRebootDelay = "bootloader_ota_reboot_delay"
+
 	sleepPurgeJobName = "mysensors_sleep_command_store"
 	sleepPurgeJobCron = "0 */5 * * * *" // every 5 minutes, same as firmware purge
 )
@@ -283,7 +291,6 @@ var internalValidFields = map[string]string{
 // Those features should be filtered here and should be implemented
 // Other than this list all other requests will be ignored
 var customValidActions = []string{
-	// internal message type request
 	"I_CONFIG",
 	"I_ID_REQUEST",
 	"I_TIME",
