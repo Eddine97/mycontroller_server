@@ -11,28 +11,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// sleepRecentlySeen is the same threshold as the OTA reboot logic.
-// A node seen within this window is considered awake.
-const sleepRecentlySeen = 30 * time.Second
-
-// sleepCommandVPercentage is the numeric code for V_PERCENTAGE
-// (see setReqFieldMapForRx in constant.go).
-const sleepCommandVPercentage = "3"
-
-// sleepCommandMaxAge is the TTL of a queued command.
-// Beyond this, the command is considered stale and purged.
-const sleepCommandMaxAge = 2 * time.Hour
+const (
+	sleepRecentlySeen    = 30 * time.Second
+	sleepCommandVPercentage = "3"
+	sleepCommandMaxAge   = 2 * time.Hour
+)
 
 // parseSleepDurationPayload extracts the optional sensor_id and the percentage.
-//
-// Accepted formats:
-//
-//	"32"         -> ("", 32, nil)
-//	"206:32"     -> ("206", 32, nil)
-//	" 206 : 32 " -> ("206", 32, nil)
-//	"foo"        -> ("", 0, err)
-//	"206:200"    -> ("", 0, err)
-//	"206:foo"    -> ("", 0, err)
 func parseSleepDurationPayload(raw string) (sensorID string, percent uint8, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -50,12 +35,6 @@ func parseSleepDurationPayload(raw string) (sensorID string, percent uint8, err 
 	return sensorID, uint8(pct), nil
 }
 
-// sendSleepCommand sends (or queues) a sleep-duration change to a smart_sleep
-// node.
-//
-// If the node is awake (recent contact), the command goes out immediately.
-// Otherwise it is stored and delivered on the next I_PRE_SLEEP_NOTIFICATION
-// or I_HEARTBEAT_RESPONSE (see deliverQueuedSleepCommandIfAny).
 func (p *Provider) sendSleepCommand(node *nodeTY.Node, sensorID string, percent uint8, requestID string) error {
 	if node == nil {
 		return fmt.Errorf("nil node")
@@ -87,7 +66,6 @@ func (p *Provider) sendSleepCommand(node *nodeTY.Node, sensorID string, percent 
 	return nil
 }
 
-// sendSleepCommandNow sends the C_SET/V_PERCENTAGE to the node immediately.
 func (p *Provider) sendSleepCommandNow(node *nodeTY.Node, sensorID string, percent uint8) error {
 	sleepMsg := msgTY.NewMessage(false)
 	sleepMsg.GatewayID = node.GatewayID
@@ -115,7 +93,6 @@ func (p *Provider) sendSleepCommandNow(node *nodeTY.Node, sensorID string, perce
 	return nil
 }
 
-// queueSleepCommand stores the command for later delivery.
 func (p *Provider) queueSleepCommand(node *nodeTY.Node, sensorID string, percent uint8, requestID string) {
 	if node == nil {
 		return
@@ -129,11 +106,6 @@ func (p *Provider) queueSleepCommand(node *nodeTY.Node, sensorID string, percent
 	})
 }
 
-// deliverQueuedSleepCommandIfAny sends the queued command when the node wakes.
-// Called from updateNodeInternalMessages() on I_PRE_SLEEP_NOTIFICATION /
-// I_HEARTBEAT_RESPONSE, same as the OTA reboot delivery.
-//
-// Idempotent: the entry is removed before sending to avoid duplicates.
 func (p *Provider) deliverQueuedSleepCommandIfAny(gatewayID, nodeID string) {
 	key := p.getNodeStoreID(gatewayID, nodeID)
 	v := pendingSleepStore.Get(key)
@@ -172,8 +144,6 @@ func (p *Provider) deliverQueuedSleepCommandIfAny(gatewayID, nodeID string) {
 		zap.Uint8("percent", cmd.Percent),
 	)
 
-	// Allow a short delay so the node has completed its wake-up sequence
-	// (heartbeat, I_CONFIG, presentation, ...) before receiving the C_SET.
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		if err := p.sendSleepCommandNow(node, cmd.SensorID, cmd.Percent); err != nil {
@@ -185,13 +155,10 @@ func (p *Provider) deliverQueuedSleepCommandIfAny(gatewayID, nodeID string) {
 	}()
 }
 
-// pendingSleepCount is used by tests.
 func pendingSleepCount() int {
 	return len(pendingSleepStore.Keys())
 }
 
-// purgeExpiredSleepCommands is scheduled like firmwareRawPurge().
-// Removes commands that are too old.
 func purgeExpiredSleepCommands() {
 	now := time.Now()
 	for _, key := range pendingSleepStore.Keys() {

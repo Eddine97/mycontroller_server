@@ -18,19 +18,19 @@ var (
 	nodeStore             = concurrency.NewStore()
 	fwStore               = concurrency.NewStore()
 	fwRawStore            = concurrency.NewStore()
-	fotaScriptStore       = concurrency.NewStore() // data_repository id -> *fotaScriptBundle
-	fotaSessionStore      = concurrency.NewStore() // gateway_node -> *fotaSession
-	otaPendingRebootStore = concurrency.NewStore() // gateway_node -> time.Time
-	pendingSleepStore     = concurrency.NewStore() // gateway_node -> pendingSleepCommand
+	fotaScriptStore       = concurrency.NewStore() // data_repository id → *fotaScriptBundle
+	fotaSessionStore      = concurrency.NewStore() // gateway_node → *fotaSession
+	otaPendingRebootStore = concurrency.NewStore() // gateway_node → time.Time
+	pendingSleepStore     = concurrency.NewStore() // gateway_node → pendingSleepCommand
 )
 
 // pendingSleepCommand is a sleep-duration change command queued for a sleeping
 // smart_sleep node.
 type pendingSleepCommand struct {
-	SensorID  string    // child sensor id that receives the V_PERCENTAGE
-	Percent   uint8     // V_PERCENTAGE value to send (0-100)
-	QueuedAt  time.Time // for TTL / purge
-	RequestID string    // optional: correlation with the caller
+	SensorID  string
+	Percent   uint8
+	QueuedAt  time.Time
+	RequestID string
 }
 
 // fotaSession is the firmware + slice size advertised in onConfig, reused for every block.
@@ -46,7 +46,7 @@ func firmwareRawPurge() {
 		if !ok {
 			continue
 		}
-		if time.Since(fw.LastAccess) >= firmwarePurgeInactiveTime { // eligible for purging
+		if time.Since(fw.LastAccess) >= firmwarePurgeInactiveTime {
 			fwRawStore.Remove(fwID)
 		}
 	}
@@ -79,7 +79,6 @@ func (p *Provider) getNode(gatewayID, nodeID string) (*nodeTY.Node, error) {
 	return nil, fmt.Errorf("node not available. gatewayID:%s, nodeID:%s", gatewayID, nodeID)
 }
 
-// getFirmware returns the firmware
 func (p *Provider) getFirmware(id string) (*firmwareTY.Firmware, error) {
 	toFirmware := func(item interface{}) (*firmwareTY.Firmware, error) {
 		if fw, ok := item.(*firmwareTY.Firmware); ok {
@@ -194,8 +193,6 @@ func assembleFirmwareBytes(blocks map[int][]byte, totalBytes int) ([]byte, bool)
 }
 
 func (p *Provider) updateFirmwareFile(id string, fwTypeID, fwVersionID uint16, blockSize int) error {
-	// Load metadata first. Do not CommandGet from inside the block callback;
-	// that nested query races with remaining block replies on the same bus.
 	fw, err := p.getFirmware(id)
 	if err != nil {
 		return err
