@@ -20,7 +20,7 @@ var (
 	fwRawStore            = concurrency.NewStore()
 	fotaScriptStore       = concurrency.NewStore() // data_repository id → *fotaScriptBundle
 	fotaSessionStore      = concurrency.NewStore() // gateway_node → *fotaSession
-	otaPendingRebootStore = concurrency.NewStore() // gateway_node → time.Time
+	otaPendingActionStore = concurrency.NewStore() // gateway_node → pendingFotaAction
 	pendingSleepStore     = concurrency.NewStore() // gateway_node → pendingSleepCommand
 )
 
@@ -31,6 +31,13 @@ type pendingSleepCommand struct {
 	Percent   uint8
 	QueuedAt  time.Time
 	RequestID string
+}
+
+// pendingFotaAction is a queued OTA action for a smart-sleep node.
+// The action is delivered on the next wake signal (I_PRE_SLEEP_NOTIFICATION).
+type pendingFotaAction struct {
+	Mode     string // FotaUpdateOnline | FotaUpdateOffline
+	QueuedAt time.Time
 }
 
 // fotaSession is the firmware + slice size advertised in onConfig, reused for every block.

@@ -1,22 +1,22 @@
 package mysensors
 
 import (
-    "errors"
-    "fmt"
-    "strconv"
-    "strings"
-    "time"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
-    "github.com/mycontroller-org/server/v2/pkg/types"
-    "github.com/mycontroller-org/server/v2/pkg/types/cmap"
-    msgTY "github.com/mycontroller-org/server/v2/pkg/types/message"
-    nodeTY "github.com/mycontroller-org/server/v2/pkg/types/node"
-    rsTY "github.com/mycontroller-org/server/v2/pkg/types/resource_service"
-    busUtils "github.com/mycontroller-org/server/v2/pkg/utils/bus_utils"
-    "github.com/mycontroller-org/server/v2/pkg/utils/bus_utils/query"
-    "github.com/mycontroller-org/server/v2/pkg/utils/convertor"
-    gwTY "github.com/mycontroller-org/server/v2/plugin/gateway/types"
-    "go.uber.org/zap"
+	"github.com/mycontroller-org/server/v2/pkg/types"
+	"github.com/mycontroller-org/server/v2/pkg/types/cmap"
+	msgTY "github.com/mycontroller-org/server/v2/pkg/types/message"
+	nodeTY "github.com/mycontroller-org/server/v2/pkg/types/node"
+	rsTY "github.com/mycontroller-org/server/v2/pkg/types/resource_service"
+	busUtils "github.com/mycontroller-org/server/v2/pkg/utils/bus_utils"
+	"github.com/mycontroller-org/server/v2/pkg/utils/bus_utils/query"
+	"github.com/mycontroller-org/server/v2/pkg/utils/convertor"
+	gwTY "github.com/mycontroller-org/server/v2/plugin/gateway/types"
+	"go.uber.org/zap"
 )
 
 // handleActions routes globally-defined features (reboot, discover, etc.)
@@ -76,41 +76,45 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 		msMsg.Type = actionTime
 
 	case nodeTY.ActionFirmwareUpdate:
-		// Check if the node is sleeping BEFORE preparing the config.
-		if node, err := p.getNode(msg.GatewayID, msg.NodeID); err == nil && isSleepingNode(node) {
-			if err := p.maybeSendRebootForOta(msg); err != nil {
-				p.logger.Error("firmware-update: pre-OTA reboot failed",
-					zap.String("nodeId", msg.NodeID),
-					zap.String("gatewayId", msg.GatewayID),
-					zap.Error(err),
-				)
-			}
-			p.logger.Info("firmware-update: config deferred until node wakes and reboots",
-				zap.String("nodeId", node.NodeID),
-				zap.String("gatewayId", node.GatewayID),
-			)
-			return nil
+		// The OTA strategy is driven by fota_update:
+		//   - offline: send (or queue) I_REBOOT. The bootloader restarts,
+		//              emits ST_FIRMWARE_CONFIG_REQUEST, and the controller
+		//              serves the blocks.
+		//   - online:  send (or queue) ST_FIRMWARE_CONFIG_RESPONSE directly.
+		//              The sketch (MY_OTA_FIRMWARE_FEATURE) listens for it,
+		//              compares the version, and starts its own OTA. No reboot.
+		//   - unknown: do nothing (passive). The controller only answers
+		//              ST_FIRMWARE_* requests that arrive spontaneously.
+		//
+		// The heavy lifting (immediate send vs queue for smart-sleep nodes) is
+		// done by maybeTriggerOta in ota_trigger.go.
+		node, err := p.getNode(msg.GatewayID, msg.NodeID)
+		if err != nil {
+			return fmt.Errorf("firmware-update: load node: %w", err)
 		}
 
-		if err := p.maybeSendRebootForOta(msg); err != nil {
-			p.logger.Error("firmware-update: pre-OTA reboot failed",
+		if err := p.maybeTriggerOta(msg); err != nil {
+			p.logger.Error("firmware-update: OTA trigger failed",
 				zap.String("nodeId", msg.NodeID),
 				zap.String("gatewayId", msg.GatewayID),
 				zap.Error(err),
 			)
 		}
-		pl, err := p.executeFirmwareConfigRequest(msg)
-		if err != nil {
-			return err
-		}
-		if pl == "" {
-			return nil
-		}
-		msMsg.Command = cmdStream
-		msMsg.Type = actionFirmwareConfigResponse
-		msMsg.Payload = strings.ToUpper(pl)
+
+		p.logger.Info("firmware-update: trigger processed, waiting for node",
+			zap.String("nodeId", node.NodeID),
+			zap.String("gatewayId", node.GatewayID),
+			zap.String("fotaUpdate", getFotaUpdateMode(node)),
+			zap.String("bootloaderKind", bootloaderKindForNode(node)),
+			zap.Bool("smartSleep", isSleepingNode(node)),
+		)
+		// Return nil: nothing to send now. The node's CONFIG_REQUEST (offline)
+		// or the sketch's own OTA flow (online) will drive the rest.
+		return nil
 
 	case "ST_FIRMWARE_CONFIG_REQUEST":
+		// The node (bootloader or protocol-3.1 sketch) explicitly asked for
+		// its config. Answer now: timing is correct by construction.
 		pl, err := p.executeFirmwareConfigRequest(msg)
 		if err != nil {
 			return err
@@ -180,7 +184,7 @@ func (p *Provider) queueRebootIfSleeping(msg *msgTY.Message) bool {
 	if !isSleepingNode(node) {
 		return false
 	}
-	p.queueRebootForNode(node)
+	p.queueFotaActionForNode(node, FotaUpdateOffline)
 	p.logger.Info("smart-sleep node, manual I_REBOOT queued until next wake",
 		zap.String("nodeId", node.NodeID),
 		zap.String("gatewayId", node.GatewayID),

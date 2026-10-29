@@ -138,18 +138,18 @@ func (p *Provider) ConvertToMessages(rawMsg *msgTY.RawMessage) ([]*msgTY.Message
 		return nil, nil
 	}
 
-	// [FIX n°5] Deliver any pending reboot or sleep command on any inbound
-	// message from the node. Smart-sleep nodes send t=33 at wake, then data,
-	// then t=32. Reacting only on t=32 leaves at most 2 s of window per 5 min
+	// Deliver any pending FOTA action or sleep command on any inbound message
+	// from the node. Smart-sleep nodes send t=33 at wake, then data, then
+	// t=32. Reacting only on t=32 leaves at most 2 s of window per 5 min
 	// cycle. Reacting on any message catches the node as soon as it starts
 	// talking.
 	if msMsg.NodeID != "" && msMsg.NodeID != idBroadcast {
 		key := p.getNodeStoreID(p.GatewayConfig.ID, msMsg.NodeID)
-		hasReboot := otaPendingRebootStore.Get(key) != nil
+		hasFota := otaPendingActionStore.Get(key) != nil
 		hasSleep := pendingSleepStore.Get(key) != nil
-		if hasReboot || hasSleep {
+		if hasFota || hasSleep {
 			go func(gwID, nodeID string) {
-				p.deliverQueuedRebootIfAny(gwID, nodeID)
+				p.deliverQueuedFotaActionIfAny(gwID, nodeID)
 				p.deliverQueuedSleepCommandIfAny(gwID, nodeID)
 			}(p.GatewayConfig.ID, msMsg.NodeID)
 		}

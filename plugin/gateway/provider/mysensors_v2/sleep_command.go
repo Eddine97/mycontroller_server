@@ -12,9 +12,9 @@ import (
 )
 
 const (
-	sleepRecentlySeen    = 30 * time.Second
+	sleepRecentlySeen       = 30 * time.Second
 	sleepCommandVPercentage = "3"
-	sleepCommandMaxAge   = 2 * time.Hour
+	sleepCommandMaxAge      = 2 * time.Hour
 )
 
 // parseSleepDurationPayload extracts the optional sensor_id and the percentage.
