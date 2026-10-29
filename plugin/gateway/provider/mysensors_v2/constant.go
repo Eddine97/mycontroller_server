@@ -37,21 +37,65 @@ const (
 	FieldAwakeDuration = "awake_duration" // smart sleep node awake duration
 	FieldSleepDuration = "sleep_duration" // smart sleep node sleep duration
 
-	// LabelBootloaderOtaReboot: when set to "true" on a node, MyController sends
-	// an I_REBOOT right before serving a firmware update. Mimics MYSController
-	// and is required for MYSBootloader-based nodes.
+	// LabelFotaUpdate drives the OTA strategy for a node. Values:
+	//   "online"  -> OTA runs in the sketch. Controller sends
+	//                ST_FIRMWARE_CONFIG_RESPONSE directly to the sketch, which
+	//                listens for it (MY_OTA_FIRMWARE_FEATURE). No reboot.
+	//                For a smart-sleep node, the response is queued until the
+	//                next wake.
+	//   "offline" -> OTA runs in the bootloader. Controller sends I_REBOOT
+	//                immediately for an awake node, or queues it until the
+	//                next wake for a smart-sleep node. The bootloader then
+	//                emits ST_FIRMWARE_CONFIG_REQUEST and the controller
+	//                serves the blocks.
+	//   "unknown" -> controller does nothing proactive. It only answers
+	//                ST_FIRMWARE_* requests that arrive spontaneously.
 	//
-	// Values:
-	//   "true"  -> auto-reboot (recommended for MYSBootloader nodes)
-	//   "false" -> no automatic reboot
-	//   absent  -> same as "false"
+	// Absent means unknown. An explicit "unknown" disables auto-initialisation
+	// (the user has made a choice and we must not override it).
 	//
-	// Sleeping nodes (smart_sleep + not seen recently) are queued: the reboot is
-	// sent when the node next reports itself awake.
-	LabelBootloaderOtaReboot = "bootloader_ota_reboot"
+	// The value is auto-initialised the first time a firmware is assigned to
+	// the node (see initFotaUpdateIfNeeded): MYSBootloader kind -> offline,
+	// any other kind (including unknown / protocol-3.1) -> online. The
+	// auto-initialised value is tagged with LabelFotaUpdateAuto so it can be
+	// corrected when bootloader detection happens later.
+	LabelFotaUpdate = "fota_update"
+
+	// LabelFotaUpdateAuto marks a fota_update value that was set by the
+	// controller (not by the user). When the node's bootloader_kind is
+	// refined later (e.g. first ST_FIRMWARE_CONFIG_REQUEST from a
+	// MYSBootloader), the controller may recompute fota_update. Any manual
+	// change by the user must clear this marker.
+	LabelFotaUpdateAuto = "fota_update_auto"
+
+	// LabelFotaDeliveryDelay overrides the delay (in milliseconds) between a
+	// wake signal (I_PRE_SLEEP_NOTIFICATION, ...) and the actual delivery of
+	// the queued OTA action (ST_FIRMWARE_CONFIG_RESPONSE for online, I_REBOOT
+	// for offline).
+	// Default: 200 ms. Must stay below the node's awake_duration.
+	// Values below 50 are clamped to 50, values above 5000 are clamped to 5000.
+	LabelFotaDeliveryDelay = "fota_delivery_delay"
+
+	// fotaCommandMaxAge bounds how long a queued OTA action (online or
+	// offline) survives in otaPendingActionStore. Older entries are dropped.
+	// Bounded in time so a node that never wakes again does not pin an
+	// action forever.
+	fotaCommandMaxAge = 2 * time.Hour
+
+	// fota purge job: drops expired entries from otaPendingActionStore every
+	// 5 minutes. Append the gateway id when registering it on the scheduler.
+	fotaPurgeJobName = "mysensors_fota_pending_purge"
+	fotaPurgeJobCron = "0 */5 * * * *"
 
 	sleepPurgeJobName = "mysensors_sleep_command_store"
 	sleepPurgeJobCron = "0 */5 * * * *" // every 5 minutes, same as firmware purge
+)
+
+// FOTA strategy values for LabelFotaUpdate.
+const (
+	FotaUpdateOnline  = "online"
+	FotaUpdateOffline = "offline"
+	FotaUpdateUnknown = "unknown"
 )
 
 // internal references
@@ -283,7 +327,6 @@ var internalValidFields = map[string]string{
 // Those features should be filtered here and should be implemented
 // Other than this list all other requests will be ignored
 var customValidActions = []string{
-	// internal message type request
 	"I_CONFIG",
 	"I_ID_REQUEST",
 	"I_TIME",

@@ -580,8 +580,8 @@ func TestFotaScriptUIEmptyRequestSameReleaseNoUpdate(t *testing.T) {
 	logger := zap.NewNop()
 	timeout := 2 * time.Second
 	raw, err := javascript.Execute(logger, wrapped, map[string]interface{}{
-		"request":    parseFotaRequest("", true),
-		"nodeLabels": map[string]string{"ab_running_slot": "A", "assigned_firmware_slot_a": "fw_a", "assigned_firmware_slot_b": "fw_b"},
+		"request":     parseFotaRequest("", true),
+		"nodeLabels":  map[string]string{"ab_running_slot": "A", "assigned_firmware_slot_a": "fw_a", "assigned_firmware_slot_b": "fw_b"},
 		"getFirmware": getFw,
 	}, &timeout)
 	if err != nil {

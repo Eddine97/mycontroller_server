@@ -227,7 +227,96 @@ func (p *Provider) buildFirmwareConfigResponse(node *nodeTY.Node, fwRaw *firmwar
 		fwCfgRes.Version = fwRaw.Version
 		fwCfgRes.Blocks = fwRaw.Blocks
 		fwCfgRes.CRC = fwRaw.CRC
+
+		// OTA-COMPLETION: normalize versions before comparing.
+		// The node label stores "1.31"; the firmware stores 31 (0x001F).
+		// Compare the numeric part only, otherwise every CONFIG_REQUEST
+		// is treated as a new update and the OTA state is re-armed forever.
+		currentVersionNum := 0
+		if v := node.Labels.Get("version"); v != "" {
+			if idx := strings.LastIndex(v, "."); idx >= 0 {
+				currentVersionNum, _ = strconv.Atoi(v[idx+1:])
+			} else {
+				currentVersionNum, _ = strconv.Atoi(v)
+			}
+		}
+		targetVersionNum := int(fwRaw.Version)
+
+		// OTA-COMPLETION: this function NO LONGER arms ota_running.
+		//
+		// Rationale:
+		//   - A CONFIG_REQUEST is sent by the node both when it enters
+		//     bootloader mode for a real update AND when it reboots after a
+		//     successful OTA to confirm the running version.
+		//   - Arming ota_running here caused a phantom OTA to re-arm itself
+		//     on every post-OTA reboot (version already equal, no block ever
+		//     served, yet progress reset to 0 and end_time cleared).
+		//   - The OTA state must be armed when the node ACTUALLY starts
+		//     requesting data blocks, i.e. on the first ST_FIRMWARE_REQUEST
+		//     served by computeOtaProgressState()/updateFirmwareProgressStatus().
+		//
+		// We still memorize the target so forceOtaCompletion() can decide
+		// success later (on I_SKETCH_VERSION, reboot, sleep, or timeout),
+		// and we close a phantom OTA if it is somehow still running.
+		if currentVersionNum != targetVersionNum {
+			// Memorize the target version/CRC/type for OTA success detection.
+			// Do NOT touch FieldOTARunning or FieldOTABlockTotal here.
+			node.Others.Set(FieldOTATargetVersion, fmt.Sprintf("%d", fwRaw.Version), nil)
+			node.Others.Set(FieldOTATargetCRC, fmt.Sprintf("%04X", fwRaw.CRC), nil)
+			node.Others.Set(FieldOTATargetType, fmt.Sprintf("%d", fwRaw.Type), nil)
+		} else if node.Others.GetBool(types.FieldOTARunning) {
+			// OTA-COMPLETION: versions are equal but ota_running is still
+			// true. This means a previous CONFIG_REQUEST armed the OTA (or a
+			// forceOtaCompletion event was lost), and the node is already on
+			// the target version. Close it as successful.
+			//
+			// With the new design (no arming in this function), this branch
+			// should only trigger in pathological cases:
+			//   - a real OTA is in progress and the node coincidentally
+			//     reported its new version before the last block status;
+			//   - or the OTA was armed by a first served block, then the node
+			//     rebooted and re-sent CONFIG_REQUEST with the new version.
+			// In both cases, closing as success is the right call.
+			now := time.Now()
+			timeTaken := int(converterUtils.ToInteger(node.Others[types.FieldOTATimeTaken]))
+			timeTakenStr := converterUtils.ToString(node.Others[types.FieldOTATimeTakenStr])
+
+			var startTimeVal interface{} = now
+			if timeTaken > 0 {
+				if v := node.Others[types.FieldOTAStartTime]; v != nil {
+					startTimeVal = v
+				}
+			}
+
+			state := map[string]interface{}{
+				types.FieldOTARunning:      false,
+				types.FieldOTAProgress:     100,
+				types.FieldOTAStartTime:    startTimeVal,
+				types.FieldOTAEndTime:      now,
+				types.FieldOTATimeTaken:    timeTaken,
+				types.FieldOTATimeTakenStr: timeTakenStr,
+				types.FieldOTABlockNumber:  nil, // clear the current block on close
+			}
+			busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
+
+			node.Others.Set(types.FieldOTARunning, false, nil)
+			node.Others.Set(types.FieldOTAProgress, 100, nil)
+			node.Others.Set(types.FieldOTAStartTime, startTimeVal, nil)
+			node.Others.Set(types.FieldOTAEndTime, now, nil)
+			node.Others.Set(types.FieldOTATimeTaken, timeTaken, nil)
+			node.Others.Set(types.FieldOTATimeTakenStr, timeTakenStr, nil)
+			node.Others.Set(types.FieldOTABlockNumber, nil, nil) // clear the current block on close
+
+			p.logger.Info("OTA state cleared (node already on target version)",
+				zap.String("nodeId", node.NodeID),
+				zap.String("gatewayId", node.GatewayID),
+				zap.Int("currentVersion", currentVersionNum),
+				zap.Int("targetVersion", targetVersionNum),
+				zap.Int("timeTaken", timeTaken),
+			)
+		}
 	}
+
 	p.logger.Debug("sending a firmware config response",
 		zap.Any("response", fwCfgRes),
 		zap.Int("blockSize", fwRaw.BlockSize),
@@ -237,6 +326,164 @@ func (p *Provider) buildFirmwareConfigResponse(node *nodeTY.Node, fwRaw *firmwar
 	)
 
 	return p.toHex(fwCfgRes)
+}
+
+// formatDuration converts a duration in seconds to a compact string,
+// e.g. 45 -> "45s", 103 -> "1m43s", 3725 -> "1h2m5s".
+// Used by forceOtaCompletion to compute the real duration when the node
+// rebooted before reporting the final status.
+func formatDuration(seconds int) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	if seconds < 3600 {
+		return fmt.Sprintf("%dm%ds", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%dh%dm%ds", seconds/3600, (seconds%3600)/60, seconds%60)
+}
+
+// OTA-COMPLETION: forceOtaCompletion publishes a final OTA state.
+// Called when a reboot signal, version change, sleep notification or timeout
+// indicates that the OTA is over. Success is decided by comparing the
+// current node version with the target memorized at setup, unless the caller
+// already knows the outcome.
+func (p *Provider) forceOtaCompletion(node *nodeTY.Node, success bool, reason string) {
+	if node == nil || node.Others == nil {
+		return
+	}
+	if !node.Others.GetBool(types.FieldOTARunning) {
+		return
+	}
+
+	// Cross-check: if the node already reports the target version, it's a success.
+	if targetVersion := node.Others.GetString(FieldOTATargetVersion); targetVersion != "" {
+		if node.Labels.Get("version") == targetVersion {
+			success = true
+		}
+	}
+
+	progress := 0
+	if success {
+		progress = 100
+	}
+
+	now := time.Now()
+
+	// OTA-COMPLETION: recover the real duration.
+	//
+	// Case 1: the node reported a final status before rebooting.
+	//         ota_time_taken > 0 and ota_time_taken_str is set.
+	//         Keep them as-is.
+	//
+	// Case 2: the node rebooted or fell asleep before the last status was
+	//         published. ota_time_taken is 0, but ota_start_time was set
+	//         when the first block was received (and preserved across sleep
+	//         cycles). Compute the duration from ota_start_time to now.
+	//
+	// Case 3: phantom OTA (no block ever served).
+	//         ota_start_time is nil, ota_time_taken is 0.
+	//         Set start = end = now so the UI renders "0s".
+	timeTaken := int(converterUtils.ToInteger(node.Others[types.FieldOTATimeTaken]))
+	timeTakenStr := converterUtils.ToString(node.Others[types.FieldOTATimeTakenStr])
+
+	startVal := node.Others[types.FieldOTAStartTime]
+	var startTime interface{} = now
+	startTimeParsed := time.Time{}
+
+	switch v := startVal.(type) {
+	case time.Time:
+		if !v.IsZero() {
+			startTimeParsed = v
+			startTime = v
+		}
+	case string:
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil && !t.IsZero() {
+			startTimeParsed = t
+			startTime = t
+		}
+	case float64:
+		if v > 0 {
+			t := time.Unix(int64(v), 0)
+			startTimeParsed = t
+			startTime = t
+		}
+	}
+
+	// If the node didn't report a final duration, compute it from start_time.
+	// This handles smart-sleep nodes that fall asleep before the last status
+	// and reboot nodes that report the version before the final block status.
+	if timeTaken <= 0 && !startTimeParsed.IsZero() {
+		elapsed := int(now.Sub(startTimeParsed).Seconds())
+		if elapsed > 0 {
+			timeTaken = elapsed
+			timeTakenStr = formatDuration(elapsed)
+		}
+	}
+
+	// OTA-COMPLETION: preserve the start time if it was already recorded.
+	// forceOtaCompletion may be called several times (reboot, sleep, version
+	// change). The first call may happen before the node reports the final
+	// status, and we must not overwrite the real start time with "now" in
+	// subsequent calls, otherwise the duration computed above collapses to 0.
+	// If startTimeParsed is zero (phantom OTA), set start = end = now.
+	finalStartTime := startTime
+	if startTimeParsed.IsZero() {
+		finalStartTime = now
+	}
+
+	// Update the local cache immediately so that a subsequent CONFIG_REQUEST
+	// in the same loop sees the cleared state, even if the bus event is
+	// delayed or lost.
+	node.Others.Set(types.FieldOTARunning, false, nil)
+	node.Others.Set(types.FieldOTAProgress, progress, nil)
+	node.Others.Set(types.FieldOTAStartTime, finalStartTime, nil)
+	node.Others.Set(types.FieldOTAEndTime, now, nil)
+	node.Others.Set(types.FieldOTATimeTaken, timeTaken, nil)
+	node.Others.Set(types.FieldOTATimeTakenStr, timeTakenStr, nil)
+	node.Others.Set(types.FieldOTABlockNumber, nil, nil) // clear the current block on close
+
+	state := map[string]interface{}{
+		types.FieldOTARunning:      false,
+		types.FieldOTAProgress:     progress,
+		types.FieldOTAStartTime:    finalStartTime,
+		types.FieldOTAEndTime:      now,
+		types.FieldOTATimeTaken:    timeTaken,
+		types.FieldOTATimeTakenStr: timeTakenStr,
+		types.FieldOTABlockNumber:  nil, // clear the current block on close
+	}
+	busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
+
+	// OTA-COMPLETION: verify persistence. If the bus event did not reach
+	// the storage service, ota_running will still be true on the next read.
+	// Logging it here makes the failure visible instead of silent.
+	if n, err := p.getNode(node.GatewayID, node.NodeID); err == nil {
+		persisted := !n.Others.GetBool(types.FieldOTARunning)
+		if !persisted {
+			p.logger.Warn("OTA state not persisted after post",
+				zap.String("nodeId", node.NodeID),
+				zap.String("gatewayId", node.GatewayID),
+				zap.Bool("expectedRunning", false),
+				zap.Any("others", n.Others),
+			)
+		}
+	} else {
+		p.logger.Warn("OTA state verification failed",
+			zap.String("nodeId", node.NodeID),
+			zap.String("gatewayId", node.GatewayID),
+			zap.Error(err),
+		)
+	}
+
+	p.logger.Info("OTA completion forced",
+		zap.String("nodeId", node.NodeID),
+		zap.String("gatewayId", node.GatewayID),
+		zap.Bool("success", success),
+		zap.String("reason", reason),
+		zap.String("targetVersion", node.Others.GetString(FieldOTATargetVersion)),
+		zap.String("currentVersion", node.Labels.Get("version")),
+		zap.Int("timeTaken", timeTaken),
+		zap.String("timeTakenStr", timeTakenStr),
+	)
 }
 
 // executeFirmwareRequest executes firmware request and response with hex payload
@@ -450,7 +697,7 @@ func (p *Provider) otaBlockSizeFromLabel(node *nodeTY.Node) int {
 	if node == nil || node.Labels == nil {
 		return 0
 	}
-	return validOtaBlockSize(node.Labels.GetInt(LabelOtaBlockSize))
+	return validOtaBlockSize(int(converterUtils.ToInteger(node.Labels[LabelOtaBlockSize])))
 }
 
 func (p *Provider) otaBlockSizeForNode(node *nodeTY.Node) int {
@@ -745,7 +992,17 @@ func toStruct(hex string, out interface{}) error {
 	return binary.Read(r, binary.LittleEndian, out)
 }
 
-func (p *Provider) updateFirmwareProgressStatus(node *nodeTY.Node, currentBlock, totalBytes, blockSize int) {
+// computeOtaProgressState returns the state to publish for a given served block.
+// Pure function: no bus, no logger, no store access. Testable directly.
+//
+// The returned `arm` flag is true when the block is the start of a new OTA
+// (block 0 in forward order, lastBlock in reverse order). The caller is
+// responsible for arming FieldOTARunning in the node cache (if it wants to)
+// and for publishing `state` on the bus.
+//
+// `ok == false` means the block must be ignored (late block after a clean
+// close, or non-milestone block).
+func computeOtaProgressState(node *nodeTY.Node, currentBlock, totalBytes, blockSize int) (state map[string]interface{}, arm bool, ok bool) {
 	otaBlockOrder := node.Labels.Get(types.LabelNodeOTABlockOrder)
 	if otaBlockOrder == "" {
 		otaBlockOrder = OTABlockOrderReverse
@@ -758,49 +1015,145 @@ func (p *Provider) updateFirmwareProgressStatus(node *nodeTY.Node, currentBlock,
 	if totalBytes%blockSize != 0 {
 		totalBlocks++
 	}
-
 	lastBlock := totalBlocks - 1
 
-	if currentBlock == 0 ||
-		currentBlock%10 == 0 || // number of blocks once send the status
-		currentBlock == lastBlock {
-
-		var startTime interface{}
-		var endTime interface{}
-
-		var isRunning bool
-		percentage := float64(currentBlock) / float64(lastBlock)
-		if otaBlockOrder == OTABlockOrderReverse {
-			percentage = 1 - percentage
-			isRunning = currentBlock != 0
-			switch currentBlock {
-			case lastBlock:
-				startTime = time.Now()
-			case 0:
-				endTime = time.Now()
-			}
-		} else {
-			isRunning = currentBlock != lastBlock
-			switch currentBlock {
-			case 0:
-				startTime = time.Now()
-			case lastBlock:
-				endTime = time.Now()
-			}
-		}
-
-		// update the status
-		state := map[string]interface{}{
-			types.FieldOTARunning:     isRunning,
-			types.FieldOTAProgress:    int(percentage * 100),
-			types.FieldOTAStatusOn:    time.Now(),
-			types.FieldOTABlockNumber: currentBlock,
-			types.FieldOTAStartTime:   startTime,
-			types.FieldOTAEndTime:     endTime,
-			types.FieldOTABlockTotal:  totalBlocks,
-		}
-
-		// publish the state
-		busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
+	var isStartCandidate bool
+	if otaBlockOrder == OTABlockOrderReverse {
+		isStartCandidate = (currentBlock == lastBlock)
+	} else {
+		isStartCandidate = (currentBlock == 0)
 	}
+
+	// Late block after a clean close: ignore, unless it is the start block
+	// of a new OTA (which is allowed to re-arm).
+	if !isStartCandidate {
+		if !node.Others.GetBool(types.FieldOTARunning) &&
+			int(converterUtils.ToInteger(node.Others[types.FieldOTAProgress])) >= 100 {
+			return nil, false, false
+		}
+		if v := node.Others[types.FieldOTAEndTime]; v != nil && v != "" {
+			return nil, false, false
+		}
+	}
+
+	// Publish only on milestone blocks (every 10), on the first block, and
+	// on the last block. Intermediate blocks would flood the bus.
+	isMilestone := currentBlock == 0 ||
+		currentBlock%10 == 0 ||
+		currentBlock == lastBlock
+	if !isMilestone {
+		return nil, false, false
+	}
+
+	// Determine whether this block marks the end of the OTA.
+	// The end is:
+	//   - block 0 in reverse order (blocks are requested from lastBlock to 0)
+	//   - block lastBlock in forward order (blocks are requested from 0 to lastBlock)
+	// The start is the other end.
+	//
+	// Symmetric, order-agnostic progress calculation. The previous
+	// implementation used 1 - currentBlock/lastBlock for reverse order,
+	// which yielded 0% on the first block (currentBlock == lastBlock) and
+	// 100% on the last block (currentBlock == 0). The bug appeared when the
+	// node sent lastBlock as the LAST block (out-of-order reception),
+	// leaving the state at 0% / running=true forever.
+	var received int
+	var isEnd bool
+	var isStart bool
+
+	switch otaBlockOrder {
+	case OTABlockOrderReverse:
+		received = lastBlock - currentBlock + 1
+		isEnd = (currentBlock == 0)
+		isStart = (currentBlock == lastBlock)
+	default:
+		received = currentBlock + 1
+		isEnd = (currentBlock == lastBlock)
+		isStart = (currentBlock == 0)
+	}
+
+	if received < 0 {
+		received = 0
+	}
+	if received > totalBlocks {
+		received = totalBlocks
+	}
+
+	percentage := 0
+	if totalBlocks > 0 {
+		percentage = (received * 100) / totalBlocks
+	}
+	if percentage > 100 {
+		percentage = 100
+	}
+
+	now := time.Now()
+
+	// The current block number only makes sense during the transfer.
+	// On the end block, clear it so the UI does not show a stale "0".
+	state = map[string]interface{}{
+		types.FieldOTARunning:    !isEnd,
+		types.FieldOTAProgress:   percentage,
+		types.FieldOTAStatusOn:   now,
+		types.FieldOTABlockTotal: totalBlocks,
+	}
+	if isEnd {
+		state[types.FieldOTABlockNumber] = nil
+	} else {
+		state[types.FieldOTABlockNumber] = currentBlock
+	}
+
+	// On the start block, arm the OTA and stamp the start time. The caller
+	// is responsible for actually setting FieldOTARunning in the node cache
+	// (see updateFirmwareProgressStatus).
+	if isStart {
+		state[types.FieldOTAStartTime] = now
+		arm = true
+	}
+
+	// On the end block, stamp the end time and compute the duration.
+	if isEnd {
+		state[types.FieldOTAEndTime] = now
+
+		// If we just reached the end, also compute the duration so the UI
+		// shows it immediately (rather than waiting for forceOtaCompletion).
+		if startVal := node.Others[types.FieldOTAStartTime]; startVal != nil {
+			var startParsed time.Time
+			switch v := startVal.(type) {
+			case time.Time:
+				startParsed = v
+			case string:
+				if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+					startParsed = t
+				}
+			case float64:
+				if v > 0 {
+					startParsed = time.Unix(int64(v), 0)
+				}
+			}
+			if !startParsed.IsZero() {
+				elapsed := int(now.Sub(startParsed).Seconds())
+				if elapsed > 0 {
+					state[types.FieldOTATimeTaken] = elapsed
+					state[types.FieldOTATimeTakenStr] = formatDuration(elapsed)
+				}
+			}
+		}
+	}
+
+	return state, arm, true
+}
+
+// updateFirmwareProgressStatus is a thin wrapper around computeOtaProgressState:
+// it computes the state, arms the OTA in the cache if this is the start block,
+// and publishes the state on the bus.
+func (p *Provider) updateFirmwareProgressStatus(node *nodeTY.Node, currentBlock, totalBytes, blockSize int) {
+	state, arm, ok := computeOtaProgressState(node, currentBlock, totalBytes, blockSize)
+	if !ok {
+		return
+	}
+	if arm {
+		node.Others.Set(types.FieldOTARunning, true, nil)
+	}
+	busUtils.PostToResourceService(p.logger, p.bus, node.ID, state, rsTY.TypeNode, rsTY.CommandFirmwareState, "")
 }

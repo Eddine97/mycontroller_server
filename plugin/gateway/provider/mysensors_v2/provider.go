@@ -133,6 +133,13 @@ func (p *Provider) Start(receivedMessageHandler func(rawMsg *msgTY.RawMessage) e
 		return err
 	}
 
+	// load fota pending purge job (per gateway, suffix with gateway id)
+	otaPurgeJobName := fmt.Sprintf("%s_%s", fotaPurgeJobName, p.GatewayConfig.ID)
+	err = p.scheduler.AddFunc(otaPurgeJobName, fotaPurgeJobCron, p.purgeExpiredFotaActions)
+	if err != nil {
+		return err
+	}
+
 	err = p.initEventListener(p.GatewayConfig.ID)
 	if err != nil {
 		return err
@@ -157,6 +164,10 @@ func (p *Provider) Close() error {
 	sleepJobName := fmt.Sprintf("%s_%s", sleepPurgeJobName, p.GatewayConfig.ID)
 	p.scheduler.RemoveFunc(sleepJobName)
 
+	// remove fota pending purge job
+	otaPurgeJobName := fmt.Sprintf("%s_%s", fotaPurgeJobName, p.GatewayConfig.ID)
+	p.scheduler.RemoveFunc(otaPurgeJobName)
+
 	// close gateway
 	return p.Protocol.Close()
 }
@@ -170,6 +181,17 @@ func (p *Provider) Post(msg *msgTY.Message) error {
 		return err
 	}
 
+	if rawMsg == nil {
+		return nil
+	}
+
+	return p.writeWithAck(rawMsg)
+}
+
+// writeWithAck writes the raw message, and if ACK is enabled on the message,
+// waits for the acknowledgement with retry. Extracted from Post() so that
+// pre-OTA reboots (sendRebootNow) get the same reliability guarantees.
+func (p *Provider) writeWithAck(rawMsg *msgTY.RawMessage) error {
 	if rawMsg == nil {
 		return nil
 	}

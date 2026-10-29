@@ -19,8 +19,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// This function is like route for globally defined features for the request like reboot, discover, etc.,
-// And this should have addition request implementation defined in "internalValidRequests" map on constants.go file
+// handleActions routes globally-defined features (reboot, discover, etc.)
 func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Message, msMsg *message) error {
 	switch fn {
 
@@ -34,6 +33,10 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 		msMsg.Payload = payloadEmpty
 
 	case nodeTY.ActionReboot:
+		// [FIX] For smart-sleep nodes, queue the reboot until the next wake.
+		if p.queueRebootIfSleeping(msg) {
+			return nil
+		}
 		msMsg.Type = actionReboot
 		msMsg.Payload = payloadEmpty
 
@@ -42,15 +45,12 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 		msMsg.Payload = payloadEmpty
 
 	case nodeTY.ActionReset:
-		// NOTE: This feature supports only for MySensorsBootloaderRF24
-		// set reset flag on the node labels
-		// reboot the node
-		// on a node reboot, bootloader asks the firmware details
-		// we pass erase EEPROM command.
-		// erase EEPROM possible only via bootloader
 		err := p.updateResetFlag(msg)
 		if err != nil {
 			return err
+		}
+		if p.queueRebootIfSleeping(msg) {
+			return nil
 		}
 		msMsg.Type = actionReboot
 		msMsg.Payload = payloadEmpty
@@ -76,29 +76,45 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 		msMsg.Type = actionTime
 
 	case nodeTY.ActionFirmwareUpdate:
-		// User-triggered action: optionally reboot the node before serving
-		// the OTA config. Required for MYSBootloader-based nodes.
-		if err := p.maybeSendRebootForOta(msg); err != nil {
-			p.logger.Error("firmware-update: pre-OTA reboot failed",
+		// The OTA strategy is driven by fota_update:
+		//   - offline: send (or queue) I_REBOOT. The bootloader restarts,
+		//              emits ST_FIRMWARE_CONFIG_REQUEST, and the controller
+		//              serves the blocks.
+		//   - online:  send (or queue) ST_FIRMWARE_CONFIG_RESPONSE directly.
+		//              The sketch (MY_OTA_FIRMWARE_FEATURE) listens for it,
+		//              compares the version, and starts its own OTA. No reboot.
+		//   - unknown: do nothing (passive). The controller only answers
+		//              ST_FIRMWARE_* requests that arrive spontaneously.
+		//
+		// The heavy lifting (immediate send vs queue for smart-sleep nodes) is
+		// done by maybeTriggerOta in ota_trigger.go.
+		node, err := p.getNode(msg.GatewayID, msg.NodeID)
+		if err != nil {
+			return fmt.Errorf("firmware-update: load node: %w", err)
+		}
+
+		if err := p.maybeTriggerOta(msg); err != nil {
+			p.logger.Error("firmware-update: OTA trigger failed",
 				zap.String("nodeId", msg.NodeID),
+				zap.String("gatewayId", msg.GatewayID),
 				zap.Error(err),
 			)
-			// Continue: the config will be served anyway.
 		}
-		pl, err := p.executeFirmwareConfigRequest(msg)
-		if err != nil {
-			return err
-		}
-		if pl == "" {
-			return nil
-		}
-		msMsg.Command = cmdStream
-		msMsg.Type = actionFirmwareConfigResponse
-		msMsg.Payload = strings.ToUpper(pl)
+
+		p.logger.Info("firmware-update: trigger processed, waiting for node",
+			zap.String("nodeId", node.NodeID),
+			zap.String("gatewayId", node.GatewayID),
+			zap.String("fotaUpdate", getFotaUpdateMode(node)),
+			zap.String("bootloaderKind", bootloaderKindForNode(node)),
+			zap.Bool("smartSleep", isSleepingNode(node)),
+		)
+		// Return nil: nothing to send now. The node's CONFIG_REQUEST (offline)
+		// or the sketch's own OTA flow (online) will drive the rest.
+		return nil
 
 	case "ST_FIRMWARE_CONFIG_REQUEST":
-		// The node already asked for its config (it is in bootloader mode).
-		// No reboot needed.
+		// The node (bootloader or protocol-3.1 sketch) explicitly asked for
+		// its config. Answer now: timing is correct by construction.
 		pl, err := p.executeFirmwareConfigRequest(msg)
 		if err != nil {
 			return err
@@ -136,8 +152,7 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 			sensorID = node.Labels.Get(LabelSleepCommandSensorID)
 		}
 		if sensorID == "" {
-			return fmt.Errorf("no sleep command sensor configured for node %s; run once: myc action node set-sleep-duration:<sensor_id>:%d %s",
-				node.NodeID, pct, msg.GatewayID+"."+msg.NodeID)
+			return fmt.Errorf("no sleep command sensor configured for node %s", node.NodeID)
 		}
 		if sensorID != node.Labels.Get(LabelSleepCommandSensorID) {
 			node.Labels.Set(LabelSleepCommandSensorID, sensorID)
@@ -151,13 +166,38 @@ func (p *Provider) handleActions(gwCfg *gwTY.Config, fn string, msg *msgTY.Messa
 	return nil
 }
 
-// getTimestamp returns timestamp in seconds from 1970
-// adds zone offset to the actual timestamp
-// user can specify different timezone as a gateway label
-// if non set, take system timezone
+// queueRebootIfSleeping checks whether the target node is a smart-sleep node.
+// If so, it queues an I_REBOOT for delivery on the next wake and returns true.
+func (p *Provider) queueRebootIfSleeping(msg *msgTY.Message) bool {
+	if msg == nil {
+		return false
+	}
+	node, err := p.getNode(msg.GatewayID, msg.NodeID)
+	if err != nil {
+		p.logger.Warn("queueRebootIfSleeping: cannot load node, fall back to immediate send",
+			zap.String("gatewayId", msg.GatewayID),
+			zap.String("nodeId", msg.NodeID),
+			zap.Error(err),
+		)
+		return false
+	}
+	if !isSleepingNode(node) {
+		return false
+	}
+	p.queueFotaActionForNode(node, FotaUpdateOffline)
+	p.logger.Info("smart-sleep node, manual I_REBOOT queued until next wake",
+		zap.String("nodeId", node.NodeID),
+		zap.String("gatewayId", node.GatewayID),
+		zap.String("awakeDuration", node.Others.GetString(FieldAwakeDuration)),
+		zap.String("sleepDuration", node.Labels.Get(FieldSleepDuration)),
+		zap.Duration("maxWait", maxSleepDuration(node)),
+	)
+	return true
+}
+
+// getTimestamp returns timestamp in seconds from 1970 with zone offset.
 func (p *Provider) getTimestamp(gwCfg *gwTY.Config) string {
 	var loc *time.Location
-	// get user defined timezone from gateway label
 	tz := gwCfg.Labels.Get(types.LabelTimezone)
 	if tz != "" {
 		_loc, err := time.LoadLocation(tz)
@@ -167,19 +207,15 @@ func (p *Provider) getTimestamp(gwCfg *gwTY.Config) string {
 		}
 		loc = _loc
 	}
-
-	// set system location, if non set
 	if loc == nil {
 		loc = time.Now().Location()
 	}
-
-	// get zone offset and include it on the unix timestamp
 	_, offset := time.Now().In(loc).Zone()
 	timestamp := time.Now().Unix() + int64(offset)
 	return strconv.FormatInt(timestamp, 10)
 }
 
-// get node id
+// getNodeID returns the first available node id.
 func (p *Provider) getNodeID(gatewayID string) string {
 	var reservedIDsString []string
 	updateNodeIDs := func(item interface{}) bool {
@@ -209,7 +245,6 @@ func (p *Provider) getNodeID(gatewayID string) string {
 		reservedIDs[index] = int(convertor.ToInteger(value))
 	}
 
-	// find first available id
 	electedID := 1
 	for id := 1; id <= 255; id++ {
 		electedID = id
@@ -233,17 +268,13 @@ func (p *Provider) getNodeID(gatewayID string) string {
 }
 
 func (p *Provider) updateResetFlag(msg *msgTY.Message) error {
-	// get the node details
 	node, err := p.getNode(msg.GatewayID, msg.NodeID)
 	if err != nil {
 		return err
 	}
-
 	var labels cmap.CustomStringMap
 	labels = labels.Init()
 	labels.Set(LabelEraseEEPROM, "true")
-
 	busUtils.PostToResourceService(p.logger, p.bus, node.ID, labels, rsTY.TypeNode, rsTY.CommandSetLabel, "")
-
 	return nil
 }
